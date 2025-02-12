@@ -1,0 +1,165 @@
+import json
+import os
+import boto3
+import logging
+from uuid import uuid4
+import datetime
+
+from completion import Completion
+from completion import Response
+from completion import Context
+
+LOGLEVEL = os.environ["logging_level"].upper()
+logger = logging.getLogger()
+logger.setLevel(LOGLEVEL)
+
+
+# Function to search the knowledgebase
+def search_knowledgebase(sessionId,applicationId,prompt) -> Completion:
+
+    completion = Completion(sessionId)
+    topk=int(os.environ["vector_top_n"])
+    
+    # Search the knowledgebase
+    search_params = {
+                        "knowledgeBaseId" : applicationId,
+                        "retrievalQuery" : { "text" : prompt },
+                        "retrievalConfiguration" : {"vectorSearchConfiguration": {"numberOfResults": topk}}
+                    }
+    retreive_result = bedrock_client.retrieve(**search_params)
+    
+    for result in  retreive_result["retrievalResults"]:
+        completion.contexts.append(Context(result['content']['text'],result['location']['s3Location']['uri']))
+
+    return completion
+    
+
+def generate_response(question, knowledgebase_results):
+    
+    temp = float(os.environ["tempreture"])
+    topp = float(os.environ["topP"])
+    
+    user_prompt = '''
+        # Instruction #
+        You are a advisor to the human who will provide prompts and you need to generate comprehensive response by taking additional information into account  
+        ###################
+        
+        # Human #
+        {question}
+        ###################
+        
+        # Information #
+        {knowledgebase_results}
+        '''.format(question=question, knowledgebase_results=knowledgebase_results)
+        
+    
+    body = json.dumps({
+        "inputText": user_prompt, 
+        "textGenerationConfig":{  
+            "temperature":temp, #Temperature controls randomness; higher values increase diversity, lower values boost predictability.
+            "topP":topp # Top P is a text generation technique, sampling from the most probable tokens in a distribution.
+        }
+    })
+    
+    logger.info(f"Generating response with model: {modelId}")
+    
+    
+    response = bedrock_runtime.invoke_model(
+        body=body,
+    	modelId=modelId,
+        accept="application/json", 
+        contentType="application/json"
+    )
+    
+    streaming_body = response['body']
+
+    # Read the StreamingBody object into a string
+    body_str = streaming_body.read().decode('utf-8')
+    
+    stream_dict = json.loads(body_str)
+    logger.info(stream_dict)
+    
+    # Extract values into separate variables
+    input_text_token_count = stream_dict['inputTextTokenCount']
+    results = stream_dict['results']
+    token_count = results[0]['tokenCount']
+    output_text = results[0]['outputText']
+
+    return Response(input_text_token_count,token_count,output_text)
+
+endpoint_url = os.environ["api_gateway_mgmt_url"]
+modelId=os.environ['model_id']
+
+logger.info(f"endpoint_url: {endpoint_url}")
+logger.info(f"modelId: {modelId}")
+
+api_client = boto3.client("apigatewaymanagementapi",endpoint_url=endpoint_url)
+# Create a session and an AmazonBedrock client
+session = boto3.Session()
+bedrock_client = session.client('bedrock-agent-runtime')
+bedrock_runtime = boto3.client(service_name="bedrock-runtime")
+
+
+def lambda_handler(event, context):
+    connectionId = event["requestContext"]["connectionId"]
+    requestId = event["requestContext"]["requestId"]
+    try:
+        body=json.loads(event["body"])
+        prompt = body["prompt"]
+        applicationId = body["applicationId"]
+        request_timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        logger_params = {
+            "connectionId": connectionId,
+            "requestId": requestId,
+            "log_metrix_type":"CHATBOT_MESSAGE_REQUEST",
+            "request_timestamp" : request_timestamp,
+            "prompt" : prompt,
+            "applicationId" : applicationId,
+            "status": "PENDING"
+        }
+        logger.info("CHATBOT_MESSAGE_REQUEST",extra= logger_params)
+
+        logger.info(f"Searching Vector DB for relevant context")
+        completion = search_knowledgebase(connectionId,applicationId,prompt)
+        
+        logger.info("Search result:") 
+        logger.info(completion.context_text)
+        logger.info("Generating response")
+        completion.response = generate_response(prompt, completion.context_text)
+        
+        intoken = completion.response.InToken
+        outtoken = completion.response.OutToken
+        response_text = completion.response.OutputText 
+        
+        logger_params = {
+            "connectionId": connectionId,
+            "requestId": requestId,
+            "log_metrix_type":"CHATBOT_MESSAGE_RESPONSE",
+            "response_timestamp" : datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "request_timestamp" : request_timestamp,
+            "prompt" : prompt,
+            "applicationId" : applicationId,
+            "response" : response_text,
+            "inToken" : intoken,
+            "outToken" : outtoken,
+            "modelId" : modelId,
+            "status":"Completed"
+        }
+        logger.info("CHATBOT_MESSAGE_RESPONSE",extra= logger_params)
+        
+        response = api_client.post_to_connection(ConnectionId=connectionId,Data=json.dumps(completion.to_json).encode('utf-8'))
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps(completion.to_json).encode('utf-8')
+        }
+    except Exception as e:
+        logger_params = {
+            "connectionId": connectionId,
+            "log_metrix_type":"CHATBOT_MESSAGE_ERROR",
+            "status" : "ERROR",
+            "error_message": e
+        }
+        logger.error(e,extra=logger_params)
+        return {"statusCode": 500, "body": f"{e}"}

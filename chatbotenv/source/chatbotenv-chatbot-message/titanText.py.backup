@@ -1,0 +1,126 @@
+import boto3
+import json
+from botocore.exceptions import ClientError
+
+
+
+
+
+class Premier:
+    def __init__(self, bedrockKnowledgeBaseId, overrideSearchType="HYBRID", maxResultCount = 1, temperature = 0, topP = 0.9):
+        self.bedrockKnowledgeBaseId = bedrockKnowledgeBaseId
+        self.maxResultCount = maxResultCount
+        self.temperature = temperature
+        self.topP = topP
+        self.searchResultSources = {}
+        self.overrideSearchType = overrideSearchType
+        self.modelId="amazon.titan-text-premier-v1:0"
+        self.inputToken = 0
+        self.outputToken = 0
+        self.result = None
+        self.resultText = ""
+
+    def LookupVectorDB(self, query):
+        bedrock_client = boto3.client('bedrock-runtime')
+        bedrock_agent_client = boto3.client("bedrock-agent-runtime")
+
+        response = bedrock_agent_client.retrieve(
+            retrievalQuery= {
+                'text': query
+            },
+            knowledgeBaseId=self.bedrockKnowledgeBaseId,
+            retrievalConfiguration= {
+                'vectorSearchConfiguration': {
+                    'numberOfResults': self.maxResultCount,
+                    #'overrideSearchType': self.overrideSearchType # optional
+                }
+            }
+        )
+        
+        results = response['retrievalResults']
+        for result in results:
+            #print(result)
+            try:
+                uri = result['location']['s3Location']['uri']
+                content = result['content']['text']
+                if uri in self.searchResultSources:
+                    self.searchResultSources[uri].append(content)
+                else:
+                    self.searchResultSources[uri] = [content]
+            except TypeError as e:
+                print(f"TypeError encountered: {e}")
+                continue
+            except KeyError as e:
+                print(f"KeyError encountered: Missing key {e}")
+                continue
+        
+        try:
+            json_output = json.dumps(self.searchResultSources, indent=4)
+            return json_output
+        except TypeError as e:
+            print(f"TypeError during JSON serialization: {e}")
+
+        
+    def Search(self, prompt):
+        bedrock_client = boto3.client('bedrock-runtime')
+
+        all_texts = ""
+        references = json.loads(self.LookupVectorDB(prompt))
+        for filename, texts in references.items():
+            for text in texts:
+                all_texts += f"{text} \n"
+
+        instruction = """
+                INSTRUCTIONS: \n\n
+                - You are an expert on all subjects.\n
+                - You must respond to QUERY in persuasive style. \n
+                - Provide accurate, detailed, and factual answers, which are strictly derived from the REFERENCES as provided here.\n
+                - If sufficient information is not available in REFERENCES as provided here, then decline to answer stating that information is not available. \n
+                - Organize your responses clearly with visual markup.\n
+                - Reason step-by-step before answering.\n
+                - Do not speculate or predict.\n
+                - Cite sources with URLs if needed as provided in REFERENCES.\n
+                - Stay neutral on sensitive topics.\n
+                - Use concise sentences and break up long paragraphs.\n
+                - Follow template INSTRUCTIONS exactly.\n
+                - Avoid flowery language and abbreviations.\n
+                \n\n
+                REFERENCES: \n\n
+                {search_results}
+                \n\n
+                QUERY:\n\n
+                {question}
+                \n\n
+                RESPONSES:
+                """.format(question=prompt,search_results=all_texts)
+                
+        print(instruction)
+        
+        body = json.dumps({
+            "inputText": instruction, 
+            "textGenerationConfig":{  
+                "temperature":self.temperature, #Temperature controls randomness; higher values increase diversity, lower values boost predictability.
+                "topP":self.topP # Top P is a text generation technique, sampling from the most probable tokens in a distribution.
+            }
+        })
+        
+        response = bedrock_client.invoke_model(
+            body=body,
+        	modelId=self.modelId,
+            accept="application/json", 
+            contentType="application/json"
+        )
+        
+        streaming_body = response['body']
+
+        # Read the StreamingBody object into a string
+        body_str = streaming_body.read().decode('utf-8')
+        
+        stream_dict = json.loads(body_str)
+        
+        self.inputToken = stream_dict['inputTextTokenCount']
+        self.result = stream_dict['results']
+        self.outputToken = self.result[0]['tokenCount']
+        self.resultText = self.result[0]['outputText']
+        
+        print(self.resultText)
