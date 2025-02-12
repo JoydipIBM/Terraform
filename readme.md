@@ -238,7 +238,9 @@ Terraform will perform the following actions:
 
 Plan: 0 to add, 4 to change, 0 to destroy.
 
+
 Changed acm_certificate_arn value to a variable called viewer_certificate for viewer_certificate section
+----------------------------------------------------------------------------------------------------------
 Ex: 
   viewer_certificate {
     cloudfront_default_certificate = true
