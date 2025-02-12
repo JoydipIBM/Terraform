@@ -1,4 +1,5 @@
- terraform state list
+terraform state list
+--------------------------------------------
 module.chatbotenv.data.archive_file.chatbotenv_lambda_archive["chatbotenv-code-analyzer"]
 module.chatbotenv.data.archive_file.chatbotenv_lambda_archive["chatbotenv-code-profiler"]
 module.chatbotenv.data.archive_file.chatbotenv_lambda_archive["chatbotenv-code-review-summary"]
